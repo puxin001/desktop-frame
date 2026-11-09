@@ -1,0 +1,19 @@
+{
+  "title": "桌面框",
+  "sources": [],
+  "window": {
+    "x": 160,
+    "y": 120,
+    "width": 580,
+    "height": 460,
+    "topmost": false,
+    "zorder": "desktop",
+    "opacity": 0.78,
+    "locked": false,
+    "blockHeights": []
+  },
+  "view": {
+    "showHidden": false,
+    "iconSize": 48
+  }
+}

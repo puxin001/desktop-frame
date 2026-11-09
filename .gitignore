@@ -1,0 +1,15 @@
+# 程序运行时自己生成的文件，不该进版本库
+app/error.log
+app/.toggle
+*.log
+
+# 系统垃圾
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
