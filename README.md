@@ -104,7 +104,7 @@ A lightweight floating file panel that stays **above the desktop but below other
 
 ### 方式一：下载打包版（推荐，适合只用不研究）
 
-1. 打开本仓库的 **Releases** 页面，下载 `桌面框_v1.0.zip`；
+1. 打开本仓库的 **Releases** 页面，下载最新版 `DesktopFrame_v1.1.0.zip`；
 2. 右键压缩包 → **属性 → 勾选「解除锁定」→ 确定**（Windows 会给网上下载的文件打标记，不解锁双击可能被拦）；
 3. 解压到任意位置，比如 `D:\桌面框`（**不要**放进 `C:\Program Files`，那里普通权限改不了配置文件）；
 4. 双击文件夹里的 **`启动桌面框.vbs`**。
