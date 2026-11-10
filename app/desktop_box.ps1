@@ -385,6 +385,11 @@ foreach ($e in @($script:AppCfg.window.blockHeights)) {
     if ($hv -ge 92 -and $hv -le 4000) { $script:BlockHeights[$hp] = $hv }
 }
 
+# 每个分区当前是「收起」还是「展开」（path → bool）。
+# 只放内存、不写 config：重进文件夹回来要重建分区，以前一重建就全部弹开，
+# 「一键收起」等于白按。有了这张表，收起状态能跟着分区走。
+$script:BlockCollapsed = @{}
+
 $script:History = New-Object System.Collections.Stack
 $script:CurrentSource = $null
 $script:CurrentPath = ''
@@ -436,14 +441,15 @@ function Update-Layout {
     # 顶上那行「路径条」已经去掉：每个分区标题右边本来就写着目录，重复一遍没必要。
     # 标题行直接顶到窗口最上沿，内容区跟着往上提一行。
     $script:pnlTitle.SetBounds(1, 1, $w - 2, 38)
-    # 右侧按钮一共四个：× — ⟳ ⚙ 固，从右往左每 32px 一个，共占 186px
-    $script:lblTitle.SetBounds(36, 0, [Math]::Max(40, $w - 36 - 190), 38)
+    # 右侧按钮一共五个：× — ⟳ ⚙ 固 ⊟，从右往左每 32px 一个，共占 218px
+    $script:lblTitle.SetBounds(36, 0, [Math]::Max(40, $w - 36 - 222), 38)
     $script:btnBack.SetBounds(6, 7, 24, 24)
     $script:btnClose.Location = New-Object Drawing.Point(($w - 2 - 30), 7)
     $script:btnCollapse.Location = New-Object Drawing.Point(($w - 2 - 60), 7)
     $script:btnRefresh.Location = New-Object Drawing.Point(($w - 2 - 92), 7)
     $script:btnSettings.Location = New-Object Drawing.Point(($w - 2 - 124), 7)
     if ($script:btnLock) { $script:btnLock.Location = New-Object Drawing.Point(($w - 2 - 156), 7) }
+    if ($script:btnAllBlocks) { $script:btnAllBlocks.Location = New-Object Drawing.Point(($w - 2 - 188), 7) }
 
     $tabsTop = 39
     # 标签栏已经取消，分区视图直接一屏列全，这里不再给它留高度
@@ -699,6 +705,9 @@ function Update-BlockLayout {
     if ($keepY -gt 0) {
         try { $body.AutoScrollPosition = New-Object Drawing.Point(0, $keepY) } catch { }
     }
+
+    # 分区被单个点开 / 收起之后，「一键收放」那个按钮的图标要跟着换（⊞ ↔ ⊟）
+    Update-AllBlocksButton
 }
 
 # 点分区标题 = 折叠 / 展开
@@ -708,7 +717,43 @@ $script:ToggleBlock = {
     if (-not $b) { return }
     $b.Collapsed = -not $b.Collapsed
     if ($b.Arrow) { $b.Arrow.Text = $(if ($b.Collapsed) { '▶' } else { '▼' }) }
+    try { $script:BlockCollapsed[[string]$b.Source.path] = [bool]$b.Collapsed } catch { }
     Update-BlockLayout
+}
+
+# ---------------------------------------------------------------- 一键收放所有分区
+# 标题栏那个 ⊟ / ⊞：按一下把所有分区内容收起来（只剩标题行），再按一下全部展开。
+# 规则：只要还有一块是展开的，就「全部收起」；全都收着的时候，按一下「全部展开」。
+function Update-AllBlocksButton {
+    if (-not $script:btnAllBlocks) { return }
+    $n = @($script:Blocks).Count
+    $c = 0
+    foreach ($b in $script:Blocks) { if ($b.Collapsed) { $c++ } }
+    $all = ($n -gt 0 -and $c -eq $n)
+    # 图标画的是「按下去会做什么」：⊟ = 收起全部，⊞ = 展开全部
+    $script:btnAllBlocks.Text = $(if ($all) { '⊞' } else { '⊟' })
+}
+
+function Set-AllBlocks {
+    param([bool]$Collapsed)
+
+    if (-not $script:Blocks -or $script:Blocks.Count -eq 0) {
+        Update-AllBlocksButton
+        return
+    }
+    foreach ($b in $script:Blocks) {
+        $b.Collapsed = $Collapsed
+        if ($b.Arrow) { $b.Arrow.Text = $(if ($Collapsed) { '▶' } else { '▼' }) }
+        try { $script:BlockCollapsed[[string]$b.Source.path] = $Collapsed } catch { }
+    }
+    Update-BlockLayout
+    Update-AllBlocksButton
+}
+
+function Toggle-AllBlocks {
+    $all = (@($script:Blocks).Count -gt 0)
+    foreach ($b in $script:Blocks) { if (-not $b.Collapsed) { $all = $false } }
+    Set-AllBlocks (-not $all)
 }
 
 function Test-CanResizeBlock {
@@ -928,7 +973,11 @@ function Rebuild-Blocks {
     $total = 0
     $dirs = 0
     foreach ($s in $valid) {
-        $b = New-Block -Source $s -Height 160
+        # 重建前是什么收放状态，重建后还保持（否则「一键收起」进个文件夹回来就白按了）
+        $spath = [string]$s.path
+        $wasCollapsed = $false
+        if ($script:BlockCollapsed.ContainsKey($spath)) { $wasCollapsed = [bool]$script:BlockCollapsed[$spath] }
+        $b = New-Block -Source $s -Height 160 -Collapsed $wasCollapsed
         $n = Fill-List -List $b.List -Path $s.path
         $total += $n
         foreach ($it in $b.List.Items) {
@@ -2018,6 +2067,20 @@ $script:btnRefresh.Add_MouseEnter({ $this.BackColor = $clrHover })
 $script:btnRefresh.Add_MouseLeave({ $this.BackColor = $clrBg })
 $script:pnlTitle.Controls.Add($script:btnRefresh)
 
+# 一键收放：⊟ 把所有分区的内容收起来，⊞ 再全部展开（图标画的是「按下去会做什么」）
+$script:btnAllBlocks = New-Object Windows.Forms.Label
+$script:btnAllBlocks.Text = '⊟'
+$script:btnAllBlocks.Font = $fontIcon
+$script:btnAllBlocks.TextAlign = 'MiddleCenter'
+$script:btnAllBlocks.Size = New-Object Drawing.Size(30, 24)
+$script:btnAllBlocks.Cursor = 'Hand'
+$script:btnAllBlocks.BackColor = $clrBg
+$script:btnAllBlocks.ForeColor = $clrMuted
+$script:btnAllBlocks.Add_Click({ Toggle-AllBlocks })
+$script:btnAllBlocks.Add_MouseEnter({ $this.BackColor = $clrHover })
+$script:btnAllBlocks.Add_MouseLeave({ $this.BackColor = $clrBg })
+$script:pnlTitle.Controls.Add($script:btnAllBlocks)
+
 $script:btnCollapse = New-Object Windows.Forms.Label
 $script:btnCollapse.Text = '—'
 $script:btnCollapse.Font = $fontBody
@@ -3008,6 +3071,55 @@ if ($SelfCheck) {
         Update-BlockLayout
         if (-not (Get-Shown $b.List)) { throw '展开后列表没出来' }
         if ($b.Panel.Height -ne $h0) { throw '展开后高度不对' }
+    }
+
+    Step '一键收放所有分区' {
+        if (-not $script:btnAllBlocks) { throw '标题栏没有这个按钮' }
+        if (-not (Get-Shown $script:btnAllBlocks)) { throw '按钮没显示' }
+        $n = @($script:Blocks).Count
+        if ($n -lt 1) { throw '没有分区可测' }
+
+        Set-AllBlocks $true
+        foreach ($b in $script:Blocks) {
+            if (-not $b.Collapsed) { throw ('没全部收起：' + $b.Source.name) }
+            if ($b.Arrow.Text -ne '▶') { throw ('箭头没跟着变：' + $b.Arrow.Text) }
+            if ($b.Panel.Height -ne $script:BlockHeaderH) { throw ('收起后只该剩标题行，实际 ' + $b.Panel.Height) }
+            if (Get-Shown $b.List) { throw ('收起后列表还显示：' + $b.Source.name) }
+        }
+        if ($script:btnAllBlocks.Text -ne '⊞') { throw ('按钮没变成「展开全部」：' + $script:btnAllBlocks.Text) }
+        # 内容全收起后不该还留一大片可滚动区域
+        if ($script:pnlBody.AutoScrollMinSize.Height -ne ($n * $script:BlockHeaderH)) {
+            throw ('收起后的滚动高度不对：' + $script:pnlBody.AutoScrollMinSize.Height)
+        }
+
+        Set-AllBlocks $false
+        foreach ($b in $script:Blocks) {
+            if ($b.Collapsed) { throw ('没全部展开：' + $b.Source.name) }
+            if ($b.Arrow.Text -ne '▼') { throw ('箭头没跟着变：' + $b.Arrow.Text) }
+            if (-not (Get-Shown $b.List)) { throw ('展开后列表没出来：' + $b.Source.name) }
+        }
+        if ($script:btnAllBlocks.Text -ne '⊟') { throw ('按钮没回到「收起全部」：' + $script:btnAllBlocks.Text) }
+
+        # 点按钮走的这条：还有一块展开着 → 全部收起
+        Toggle-AllBlocks
+        $left = 0
+        foreach ($b in $script:Blocks) { if (-not $b.Collapsed) { $left++ } }
+        if ($left -ne 0) { throw ('按一下还有 ' + $left + ' 块没收起') }
+        # 全都收着 → 全部展开
+        Toggle-AllBlocks
+        $c2 = 0
+        foreach ($b in $script:Blocks) { if ($b.Collapsed) { $c2++ } }
+        if ($c2 -ne 0) { throw ('再按一下还有 ' + $c2 + ' 块没展开') }
+
+        # 收起状态要能扛住重建（进文件夹再回来不弹开）
+        $null = Set-AllBlocks $true
+        Rebuild-Blocks
+        $re = 0
+        foreach ($b in $script:Blocks) { if (-not $b.Collapsed) { $re++ } }
+        if ($re -ne 0) { throw ('重建后有 ' + $re + ' 块被弹开了') }
+        $null = Set-AllBlocks $false
+        $script:BlockCollapsed.Clear()
+        Rebuild-Blocks
     }
 
     Step '拖动改分区高度' {
