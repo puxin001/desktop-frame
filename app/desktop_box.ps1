@@ -712,6 +712,8 @@ function Update-BlockLayout {
 
 # 点分区标题 = 折叠 / 展开
 $script:ToggleBlock = {
+    # 刚拖完排序松手时，系统还会补一个 Click —— 那不是「点标题折叠」，得吞掉
+    if ([DateTime]::Now -lt $script:SuppressClickUntil) { return }
     $b = $this.Tag
     if (-not $b) { $b = $this.Parent.Tag }
     if (-not $b) { return }
@@ -719,6 +721,165 @@ $script:ToggleBlock = {
     if ($b.Arrow) { $b.Arrow.Text = $(if ($b.Collapsed) { '▶' } else { '▼' }) }
     try { $script:BlockCollapsed[[string]$b.Source.path] = [bool]$b.Collapsed } catch { }
     Update-BlockLayout
+}
+
+# ---------------------------------------------------------------- 拖动分区标题栏排序
+# 在分区标题栏上按住、上下拖 = 换位置，松手落位并立刻写进 config.json。
+# 实现上不搬控件（搬控件会跟 AutoScroll / 块内滚动打架），只在目标位置画一条
+# 3px 的指示线；松手后重排 $script:Blocks 与 $script:Sources，重新布局一次。
+$script:BlockDrag = $null                     # @{ block; from; insert; moved; startX; startY }
+$script:SuppressClickUntil = [DateTime]::MinValue
+$script:DropLine = $null                      # 目标位置那条线（第一次用到才建）
+
+# 按客户区纵坐标算「该插到第几块前面」+ 那条线画在哪
+function Get-BlockIndexAtY {
+    param([int]$ClientY)
+    $n = @($script:Blocks).Count
+    $y = 0
+    for ($i = 0; $i -lt $n; $i++) {
+        $b = $script:Blocks[$i]
+        $h = $(if ($b.Collapsed) { $script:BlockHeaderH } else { [int]$b.Height })
+        if ($ClientY -lt ($y + [int]($h / 2))) { return [pscustomobject]@{ index = $i; y = $y } }
+        $y += $h
+    }
+    return [pscustomobject]@{ index = $n; y = $y }
+}
+
+# 指示线第一次用到才建，但建完立刻把 Handle 创建出来：
+# 否则首次显示时会有一下没画出来（DrawToBitmap 甚至完全画不到它）。
+function New-DropLine {
+    if ($script:DropLine -and -not $script:DropLine.IsDisposed) { return $script:DropLine }
+    $ln = New-Object Windows.Forms.Panel
+    $ln.Height = 4
+    $ln.BackColor = $clrAccent
+    $ln.Visible = $false
+    $script:DropLine = $ln
+    if ($form) {
+        $form.Controls.Add($ln)
+        try { $null = $ln.Handle } catch { }
+        try { $form.Controls.SetChildIndex($ln, 0) } catch { }
+    }
+    return $ln
+}
+
+function Show-DropLine {
+    # $Y 是 pnlBody 的内容坐标（含滚动量），这里换算到窗体客户坐标再画。
+    # 线挂在窗体上而不是 pnlBody 里：pnlBody 的子控件（分区面板）会按 Z 序把它压住，
+    # 之前就出现过「只有右边缘露出一小条绿线」—— 挂窗体 + 置顶才盖得住。
+    param([int]$Y, [int]$Width)
+    $body = $script:pnlBody
+    if (-not $body -or -not $form) { return }
+    $ln = New-DropLine
+    $scr = $body.PointToScreen((New-Object Drawing.Point(0, $Y)))
+    $pt = $form.PointToClient($scr)
+    $w = [Math]::Max(40, $Width)
+    $ln.SetBounds([Math]::Max(0, $pt.X), [Math]::Max(0, $pt.Y - 2), $w, 4)
+    $ln.Visible = $true
+    try { $form.Controls.SetChildIndex($ln, 0) } catch { }
+}
+
+function Hide-DropLine {
+    if ($script:DropLine -and -not $script:DropLine.IsDisposed) {
+        try { $script:DropLine.Visible = $false } catch { }
+    }
+}
+
+# 把第 From 块挪到「去掉自己之后」的第 Insert 个位置。
+# 不重新读盘：分区对象原地重排 + 重新布局一次，所以换位置是瞬时的，不会闪。
+function Move-BlockTo {
+    param([int]$From, [int]$Insert)
+
+    $all = @($script:Blocks)
+    if ($all.Count -lt 2) { return $false }
+    if ($From -lt 0 -or $From -ge $all.Count) { return $false }
+
+    $src = $all[$From].Source
+    $order = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $all.Count; $i++) {
+        if ($i -ne $From) { [void]$order.Add($all[$i].Source) }
+    }
+    $to = $Insert
+    if ($to -lt 0) { $to = 0 }
+    if ($to -gt $order.Count) { $to = $order.Count }
+    if ($to -eq $From) { return $false }        # 位置没变，别白折腾
+    $order.Insert($to, $src)
+
+    $script:Sources = @($order)
+    $script:AppCfg.sources = @($script:Sources)
+
+    # 分区对象按新顺序排一遍（匹配不齐就退回重建，保证不会错位）
+    $nb = New-Object System.Collections.ArrayList
+    foreach ($s in $script:Sources) {
+        foreach ($b in $all) {
+            if ([object]::ReferenceEquals($b.Source, $s)) { [void]$nb.Add($b); break }
+        }
+    }
+    if ($nb.Count -eq $all.Count) {
+        $script:Blocks = @($nb)
+        Update-BlockLayout
+    } else {
+        Rebuild-Blocks
+    }
+
+    try { Save-Config $script:AppCfg | Out-Null } catch { }
+    return $true
+}
+
+$script:BlockDragDown = {
+    if ($script:BlockDrag) { return }
+    if ($script:ResizeBlock) { return }                 # 正在拖高度，不抢
+    if (@($script:Blocks).Count -lt 2) { return }
+    $b = $this.Tag
+    if (-not $b) { $b = $this.Parent.Tag }
+    if (-not $b) { return }
+    $script:BlockDrag = [pscustomobject]@{
+        block  = $b
+        from   = [array]::IndexOf(@($script:Blocks), $b)
+        startX = [Windows.Forms.Cursor]::Position.X
+        startY = [Windows.Forms.Cursor]::Position.Y
+        insert = -1
+        moved  = $false
+    }
+    # 先把指示线的 Handle 建好（拖起来才不会第一下画不出来）
+    try { $null = New-DropLine } catch { }
+    try { $this.Capture = $true } catch { }
+}
+
+$script:BlockDragMove = {
+    $d = $script:BlockDrag
+    if (-not $d) { return }
+    if (-not ([Windows.Forms.Control]::MouseButtons -eq [Windows.Forms.MouseButtons]::Left)) { return }
+    if (-not $d.moved) {
+        # 6px 以内还是「点击」，别把点标题折叠误判成拖动
+        $dy = [Math]::Abs([Windows.Forms.Cursor]::Position.Y - $d.startY)
+        $dx = [Math]::Abs([Windows.Forms.Cursor]::Position.X - $d.startX)
+        if ($dy -lt 6 -and $dx -lt 6) { return }
+        $d.moved = $true
+        try { $d.block.Header.BackColor = $clrHover } catch { }
+    }
+    $body = $script:pnlBody
+    if (-not $body) { return }
+    $pt = $body.PointToClient([Windows.Forms.Cursor]::Position)
+    $hit = Get-BlockIndexAtY -ClientY $pt.Y
+    $d.insert = $hit.index
+    Show-DropLine -Y $hit.y -Width ($body.ClientSize.Width - 2)
+}
+
+$script:BlockDragUp = {
+    $d = $script:BlockDrag
+    $script:BlockDrag = $null
+    try { $this.Capture = $false } catch { }
+    if (-not $d) { return }
+    Hide-DropLine
+    if ($d.block -and $d.block.Header) { try { $d.block.Header.BackColor = $clrSoft } catch { } }
+    if (-not $d.moved) { return }                        # 没动过，交给 Click 去折叠
+    # 松手会补一个 Click，300ms 内不让它触发折叠
+    $script:SuppressClickUntil = [DateTime]::Now.AddMilliseconds(300)
+    $to = [int]$d.insert
+    if ($to -lt 0) { return }
+    # insert 是「含自己在内」的位次，换算成「去掉自己之后」的位次
+    if ($to -gt [int]$d.from) { $to = $to - 1 }
+    $null = Move-BlockTo -From ([int]$d.from) -Insert $to
 }
 
 # ---------------------------------------------------------------- 一键收放所有分区
@@ -859,6 +1020,14 @@ function New-Block {
     $title.Add_Click($script:ToggleBlock)
     $pl.Add_Click($script:ToggleBlock)
 
+    # 标题栏（连同上面的箭头 / 名称 / 路径）按住往上下拖 = 调换目录顺序。
+    # 子控件不会把鼠标事件冒泡给 Header，所以四个都要挂。
+    foreach ($hc in @($hd, $arrow, $title, $pl)) {
+        $hc.Add_MouseDown($script:BlockDragDown)
+        $hc.Add_MouseMove($script:BlockDragMove)
+        $hc.Add_MouseUp($script:BlockDragUp)
+    }
+
     $nb.Add_Click({ New-FolderIn -Dir $this.Parent.Tag.Source.path })
     $nb.Add_MouseEnter({ $this.ForeColor = $clrAccent })
     $nb.Add_MouseLeave({ $this.ForeColor = $clrMuted })
@@ -950,6 +1119,8 @@ function Get-SavedBlockHeight {
 }
 
 function Rebuild-Blocks {
+    # 指示线是 pnlBody 的临时子控件，重建时 Controls.Clear 会把它摘掉，先销毁干净
+    if ($script:DropLine) { try { $script:DropLine.Dispose() } catch { } $script:DropLine = $null }
     foreach ($b in $script:Blocks) {
         try { $b.Panel.Dispose() } catch { }
     }
@@ -3120,6 +3291,49 @@ if ($SelfCheck) {
         $null = Set-AllBlocks $false
         $script:BlockCollapsed.Clear()
         Rebuild-Blocks
+    }
+
+    Step '拖动分区标题栏排序' {
+        $n = @($script:Blocks).Count
+        if ($n -lt 3) { throw '分区太少，测不了排序' }
+        $orig = @($script:Sources)
+
+        # 1) 插入位置换算：拖到最上面 → 第 0 位；拖到最下面 → 末位
+        $top = Get-BlockIndexAtY -ClientY (-50)
+        if ($top.index -ne 0) { throw ('拖到顶上应插第 0 位，实际 ' + $top.index) }
+        $bot = Get-BlockIndexAtY -ClientY 99999
+        if ($bot.index -ne $n) { throw ('拖到最下面应插第 ' + $n + ' 位，实际 ' + $bot.index) }
+
+        try {
+            # 2) 第 1 块挪到第 3 位（去掉自己之后的位次）：分区对象和来源列表都要动
+            $name0 = [string]$script:Blocks[0].Source.name
+            if (-not (Move-BlockTo -From 0 -Insert 2)) { throw 'Move-BlockTo 没生效' }
+            if ([string]$script:Blocks[2].Source.name -ne $name0) { throw ('分区没跟着换：' + [string]$script:Blocks[2].Source.name) }
+            if ([string]$script:Sources[2].name -ne $name0) { throw ('来源顺序没跟着换：' + [string]$script:Sources[2].name) }
+            $prev = -1
+            foreach ($b in $script:Blocks) {
+                if ($b.Panel.Top -lt $prev) { throw '重排后分区没重新布局' }
+                $prev = $b.Panel.Top
+            }
+
+            # 3) 新顺序要能落到 config 里（重启后还是这个顺序）
+            $back3 = Read-Config
+            $diskNames = @()
+            foreach ($s in @($back3.sources)) { $diskNames += [string]$s.name }
+            $memNames = @()
+            foreach ($s in @($script:Sources)) { $memNames += [string]$s.name }
+            if (($diskNames -join '|') -ne ($memNames -join '|')) { throw '新顺序没写进 config' }
+
+            # 4) 挪到最后、拖回最前，都不能错位；原位不动时不该白折腾
+            $last = [string]$script:Blocks[$n - 1].Source.name
+            $null = Move-BlockTo -From ($n - 1) -Insert 0
+            if ([string]$script:Blocks[0].Source.name -ne $last) { throw '挪到最前面失败' }
+            if (Move-BlockTo -From 0 -Insert 0) { throw '位置没变却动了' }
+        } finally {
+            $script:Sources = $orig
+            $script:AppCfg.sources = @($orig)
+            Rebuild-Blocks
+        }
     }
 
     Step '拖动改分区高度' {
