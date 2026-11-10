@@ -63,6 +63,9 @@ function New-DefaultConfig {
             # 每个分区上次被拖成多高（path → h）。空数组 = 全部按内容自适应。
             # 必须在这里先声明：pscustomobject 不允许事后加属性。
             blockHeights = @()
+            # 外观：bgColor 是自定义背景色（''=默认米白），bgImage 是背景图路径（''=不用图）
+            bgColor = ''
+            bgImage = ''
         }
         view    = [pscustomobject]@{ showHidden = $false; iconSize = 48 }
     }
@@ -133,6 +136,17 @@ function Read-Config {
             }
             $cfg.window.blockHeights = $bh
         }
+
+        # 外观：bgColor 只认 #RRGGBB，bgImage 只认字符串（文件在不在留给运行时判断，
+        # 用户可能把图放在 U 盘 / 移动硬盘上，拔了不该让整个配置报废）
+        if ($j.window.PSObject.Properties['bgColor']) {
+            $bc = [string]$j.window.bgColor
+            if ($bc -match '^#[0-9A-Fa-f]{6}$') { $cfg.window.bgColor = $bc.ToUpper() }
+        }
+        if ($j.window.PSObject.Properties['bgImage']) {
+            $bi = [string]$j.window.bgImage
+            if ($bi) { $cfg.window.bgImage = $bi }
+        }
     }
     if ($j.PSObject.Properties['view'] -and $j.view) {
         foreach ($k in @('showHidden', 'iconSize')) {
@@ -183,6 +197,15 @@ function Save-Config {
             $bhList += [ordered]@{ path = $bp; h = $bh }
         }
 
+        # 外观：颜色只接受 #RRGGBB（其它一律当「默认」），图片只留路径字符串
+        $bgColorOut = ''
+        try {
+            $bc = [string]$cfg.window.bgColor
+            if ($bc -match '^#[0-9A-Fa-f]{6}$') { $bgColorOut = $bc.ToUpper() }
+        } catch { }
+        $bgImageOut = ''
+        try { $bgImageOut = [string]$cfg.window.bgImage } catch { }
+
         $clean = [ordered]@{
             title   = [string]$cfg.title
             sources = $srcList
@@ -195,6 +218,8 @@ function Save-Config {
                 zorder  = $(if ($cfg.window.topmost) { 'top' } else { 'desktop' })
                 opacity = $op
                 locked  = [bool]$cfg.window.locked
+                bgColor = $bgColorOut
+                bgImage = $bgImageOut
                 blockHeights = $bhList
             }
             view    = [ordered]@{
@@ -411,6 +436,240 @@ $clrAccentSoft = [Drawing.ColorTranslator]::FromHtml('#9BBCB0')
 $clrHover = [Drawing.ColorTranslator]::FromHtml('#EFEDE7')
 $clrBorder = [Drawing.ColorTranslator]::FromHtml('#D6D2CA')
 $clrSoft = [Drawing.ColorTranslator]::FromHtml('#F3F1EA')
+
+# ---------------------------------------------------------------- 外观：背景色 / 背景图
+# 这里只放「怎么把配置里的外观变成颜色」。默认（既没选色也没选图）时，
+# 上面那九个颜色原封不动，观感和以前完全一样。
+$script:ThemeBg = ''
+try { $script:ThemeBg = [string]$script:AppCfg.window.bgColor } catch { }
+if ($script:ThemeBg -notmatch '^#[0-9A-Fa-f]{6}$') { $script:ThemeBg = '' }
+$script:ThemeImage = ''
+try { $script:ThemeImage = [string]$script:AppCfg.window.bgImage } catch { }
+$script:ThemeImg = $null      # 已经解码好的背景图（失败就是 $null）
+$script:ThemeImgAvg = [Drawing.Color]::FromArgb(255, 245, 243, 238)
+$script:BlockGap = 0          # 有背景图时分区之间留 8px，让图能露出来
+
+function ConvertTo-ThemeColor {
+    param([string]$Hex)
+    try { return [Drawing.ColorTranslator]::FromHtml($Hex) } catch { }
+    return [Drawing.Color]::White
+}
+
+function Get-ColorLum {
+    param($c)
+    if (-not $c) { return 255 }
+    return (0.299 * [double]$c.R + 0.587 * [double]$c.G + 0.114 * [double]$c.B)
+}
+
+# 把颜色 c 往 to 方向混 t（0..1）
+function Mix-Color {
+    param($c, $to, [double]$t)
+    if ($t -lt 0) { $t = 0 }
+    if ($t -gt 1) { $t = 1 }
+    $r = [int][Math]::Round([double]$c.R + ([double]$to.R - [double]$c.R) * $t)
+    $g = [int][Math]::Round([double]$c.G + ([double]$to.G - [double]$c.G) * $t)
+    $b = [int][Math]::Round([double]$c.B + ([double]$to.B - [double]$c.B) * $t)
+    if ($r -lt 0) { $r = 0 }; if ($r -gt 255) { $r = 255 }
+    if ($g -lt 0) { $g = 0 }; if ($g -gt 255) { $g = 255 }
+    if ($b -lt 0) { $b = 0 }; if ($b -gt 255) { $b = 255 }
+    return [Drawing.Color]::FromArgb(255, $r, $g, $b)
+}
+
+function Test-ColorDark {
+    param($c)
+    return ((Get-ColorLum $c) -lt 132)
+}
+
+# 读图：整张读进内存再解码，不锁盘上的文件（否则用户想换图都删不掉）。
+# 顺带取一个平均色，用来决定「文字该用深色还是浅色」以及列表底色。
+function Get-ThemeImageInfo {
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $img = $null
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $ms = New-Object System.IO.MemoryStream(, $bytes)
+        $img = New-Object Drawing.Bitmap ([Drawing.Image]::FromStream($ms))
+        $ms.Dispose()
+    } catch {
+        if ($img) { try { $img.Dispose() } catch { } }
+        return $null
+    }
+    if (-not $img) { return $null }
+
+    # 缩到 1×1 取平均色（比逐像素快得多）
+    # 缩到 24×24 再逐点平均。别缩到 1×1：GDI+ 在这种极端缩放下经常一个像素都不铺，
+    # 拿到的会是「Clear 时垫的白」，平均色永远是白的，深浅判断就全错了。
+    $avg = [Drawing.Color]::FromArgb(255, 240, 240, 240)
+    try {
+        $n = 24
+        $tiny = New-Object Drawing.Bitmap($n, $n)
+        $g = [Drawing.Graphics]::FromImage($tiny)
+        $g.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.Clear([Drawing.Color]::White)
+        $g.DrawImage($img, (New-Object Drawing.Rectangle(0, 0, $n, $n)))
+        $g.Dispose()
+        $sr = 0; $sg = 0; $sb = 0
+        for ($yy = 0; $yy -lt $n; $yy++) {
+            for ($xx = 0; $xx -lt $n; $xx++) {
+                $px = $tiny.GetPixel($xx, $yy)
+                $sr += [int]$px.R; $sg += [int]$px.G; $sb += [int]$px.B
+            }
+        }
+        $cnt = $n * $n
+        $avg = [Drawing.Color]::FromArgb(255, [int]($sr / $cnt), [int]($sg / $cnt), [int]($sb / $cnt))
+        $tiny.Dispose()
+    } catch { }
+
+    return [pscustomobject]@{ image = $img; avg = $avg }
+}
+
+# 重新读一遍背景图（设置里换了图、或者启动时读一次）
+function Reload-ThemeImage {
+    if ($script:ThemeImg) {
+        # 先把窗体上的引用摘掉再 Dispose，否则画到一半的图会炸（GDI+ 对象已释放）
+        try { if ($form -and $form.BackgroundImage -eq $script:ThemeImg) { $form.BackgroundImage = $null } } catch { }
+        try { $script:ThemeImg.Dispose() } catch { }
+        $script:ThemeImg = $null
+    }
+    if (-not $script:ThemeImage) { return $false }
+    $info = Get-ThemeImageInfo $script:ThemeImage
+    if (-not $info) { return $false }
+    $script:ThemeImg = $info.image
+    $script:ThemeImgAvg = $info.avg
+    return $true
+}
+
+# 按当前「背景色 / 背景图」算出九个颜色。
+# 默认外观走第一支，原色一个字节都不改。
+function Update-Theme {
+    $bgHex = $script:ThemeBg
+    if ($bgHex -notmatch '^#[0-9A-Fa-f]{6}$') { $bgHex = '' }
+
+    if (-not $bgHex -and -not $script:ThemeImg) {
+        $script:clrBg = [Drawing.ColorTranslator]::FromHtml('#FBFAF7')
+        $script:clrFg = [Drawing.ColorTranslator]::FromHtml('#17212B')
+        $script:clrMuted = [Drawing.ColorTranslator]::FromHtml('#8A94A3')
+        $script:clrAccent = [Drawing.ColorTranslator]::FromHtml('#1F6F5C')
+        $script:clrLine = [Drawing.ColorTranslator]::FromHtml('#E6E3DC')
+        $script:clrAccentSoft = [Drawing.ColorTranslator]::FromHtml('#9BBCB0')
+        $script:clrHover = [Drawing.ColorTranslator]::FromHtml('#EFEDE7')
+        $script:clrBorder = [Drawing.ColorTranslator]::FromHtml('#D6D2CA')
+        $script:clrSoft = [Drawing.ColorTranslator]::FromHtml('#F3F1EA')
+        $script:BlockGap = 0
+        return
+    }
+
+    $white = [Drawing.Color]::White
+    $black = [Drawing.Color]::Black
+    $bg = $(if ($bgHex) { ConvertTo-ThemeColor $bgHex } else { ConvertTo-ThemeColor '#FBFAF7' })
+
+    # 有图：列表 / 卡片的底色跟着图片的平均色走，免得花花绿绿糊成一片
+    if ($script:ThemeImg) {
+        $bg = $script:ThemeImgAvg
+        $lumImg = Get-ColorLum $bg
+        if ($lumImg -gt 200) { $bg = Mix-Color $bg $black 0.16 }
+        elseif ($lumImg -lt 42) { $bg = Mix-Color $bg $white 0.14 }
+    }
+
+    $dark = Test-ColorDark $bg
+    $script:clrBg = $bg
+    if ($dark) {
+        $script:clrFg = ConvertTo-ThemeColor '#E9E7E2'
+        $script:clrMuted = ConvertTo-ThemeColor '#A7AEB6'
+        $script:clrSoft = Mix-Color $bg $white 0.10
+        $script:clrHover = Mix-Color $bg $white 0.17
+        $script:clrLine = Mix-Color $bg $white 0.24
+        $script:clrBorder = Mix-Color $bg $white 0.30
+        $script:clrAccent = ConvertTo-ThemeColor '#7FC9B4'
+        $script:clrAccentSoft = ConvertTo-ThemeColor '#54897A'
+    } else {
+        $script:clrFg = ConvertTo-ThemeColor '#17212B'
+        $script:clrMuted = ConvertTo-ThemeColor '#8A94A3'
+        $script:clrSoft = Mix-Color $bg $black 0.045
+        $script:clrHover = Mix-Color $bg $black 0.075
+        $script:clrLine = Mix-Color $bg $black 0.12
+        $script:clrBorder = Mix-Color $bg $black 0.18
+        $script:clrAccent = ConvertTo-ThemeColor '#1F6F5C'
+        $script:clrAccentSoft = ConvertTo-ThemeColor '#9BBCB0'
+    }
+    $script:BlockGap = $(if ($script:ThemeImg) { 8 } else { 0 })
+}
+
+# 标题栏底色：有背景图时透明（让图透出来），否则就是普通背景色
+function Get-BarBackColor {
+    if ($script:ThemeImg) { return [Drawing.Color]::Transparent }
+    return $script:clrBg
+}
+
+function Set-CtrlColors {
+    param($c, $back, $fore)
+    if (-not $c) { return }
+    if ($null -ne $back) { try { $c.BackColor = $back } catch { } }
+    if ($null -ne $fore) { try { $c.ForeColor = $fore } catch { } }
+}
+
+# 把窗体现在的外观贴上去（背景图 + 所有已建控件的颜色）
+function Apply-BackgroundImage {
+    if (-not $form) { return }
+    $old = $null
+    try { $old = $form.BackgroundImage } catch { }
+    try { $form.BackgroundImage = $null } catch { }
+    if ($script:ThemeImg) {
+        try {
+            $form.BackgroundImage = $script:ThemeImg
+            $form.BackgroundImageLayout = [Windows.Forms.ImageLayout]::Stretch
+        } catch { }
+    }
+    # 旧图如果是我们自己 new 出来的，换图时释放掉；缓存里的那张别碰
+    if ($old -and ($old -ne $script:ThemeImg)) {
+        try { $old.Dispose() } catch { }
+    }
+}
+
+function Update-ThemeControls {
+    $bar = Get-BarBackColor
+    $bgT = $(if ($script:ThemeImg) { [Drawing.Color]::Transparent } else { $script:clrBg })
+
+    Set-CtrlColors $form $script:clrBg $null
+    Set-CtrlColors $script:pnlTitle $bar $null
+    Set-CtrlColors $script:lblTitle $bar $script:clrFg
+    foreach ($b in @($script:btnBack, $script:btnSettings, $script:btnRefresh, $script:btnCollapse, $script:btnClose, $script:btnAllBlocks)) {
+        Set-CtrlColors $b $bar $script:clrMuted
+    }
+    if ($script:btnLock) {
+        if ($script:Locked) { Set-CtrlColors $script:btnLock $script:clrAccentSoft ([Drawing.Color]::White) }
+        else { Set-CtrlColors $script:btnLock $bar $script:clrMuted }
+    }
+    if ($script:btnBack) { Set-CtrlColors $script:btnBack $bar $script:clrLine }
+    if ($script:btnClose) { Set-CtrlColors $script:btnClose $bar $script:clrMuted }
+
+    Set-CtrlColors $script:pnlTabs $script:clrBg $null
+    Set-CtrlColors $script:lv $script:clrBg $script:clrFg
+    Set-CtrlColors $script:pnlBody $bgT $null
+    Set-CtrlColors $script:lblStatus $bar $script:clrMuted
+    Set-CtrlColors $script:pnlEmpty $script:clrBg $null
+    Set-CtrlColors $script:lblEmpty1 $script:clrFg $null
+    Set-CtrlColors $script:lblEmpty2 $script:clrMuted $null
+    Set-CtrlColors $script:btnAdd $script:clrAccent ([Drawing.Color]::White)
+    Set-CtrlColors $script:btnCfg $script:clrSoft $script:clrFg
+}
+
+# 设置里改完外观后统一走这里：重新取色 → 贴图 → 重刷控件 → 重建分区
+function Apply-Appearance {
+    param([switch]$NoRebuild)
+    $null = Reload-ThemeImage
+    Update-Theme
+    Apply-BackgroundImage
+    Update-ThemeControls
+    if (-not $NoRebuild -and $script:pnlBody -and $script:pnlBody.Visible) {
+        Rebuild-Blocks
+    } else {
+        Update-BlockLayout
+    }
+    Update-Layout
+}
 
 $fontTitle = New-Object Drawing.Font('Microsoft YaHei UI', 10.5, [Drawing.FontStyle]::Bold)
 $fontBody = New-Object Drawing.Font('Microsoft YaHei UI', 9)
@@ -662,9 +921,15 @@ function Update-BlockLayout {
         try { $body.AutoScrollPosition = New-Object Drawing.Point(0, 0) } catch { }
     }
 
+    # 有背景图时分区之间留一道 8px 的缝，图片能从缝里露出来；默认 0，布局和以前一模一样
+    $gap = 0
+    try { $gap = [int]$script:BlockGap } catch { }
+    if ($gap -lt 0) { $gap = 0 }
+
     $total = 0
     foreach ($b in $script:Blocks) {
         if ($b.Collapsed) { $total += $script:BlockHeaderH } else { $total += $b.Height }
+        $total += $gap
     }
 
     $needScroll = ($total -gt $body.ClientSize.Height)
@@ -695,7 +960,7 @@ function Update-BlockLayout {
             $b.Grip.SetBounds(0, $h - $script:BlockGripH, $w, $script:BlockGripH)
             try { $b.List.Columns[0].Width = [Math]::Max(80, $b.List.ClientSize.Width - 4) } catch { }
         }
-        $y += $h
+        $y += $h + $gap
     }
     $body.AutoScrollMinSize = New-Object Drawing.Size(0, $y)
 
@@ -1798,7 +2063,7 @@ function Show-Settings {
     $script:SetDlg = $dlg
     $script:SetSaved = $false
     $dlg.Text = '设置'
-    $dlg.ClientSize = New-Object Drawing.Size(524, 444)
+    $dlg.ClientSize = New-Object Drawing.Size(524, 490)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
@@ -1866,9 +2131,85 @@ function Show-Settings {
     $chkAuto.Checked = (Test-AutoStart)
     $dlg.Controls.Add($chkAuto)
 
+    # ---- 外观：背景颜色 / 背景图 ----------------------------------------
+    # 选完立刻在主窗口上生效（设置窗是模态的，背后就是框，直接能看见效果）。
+    $lblLook = New-Object Windows.Forms.Label
+    $lblLook.Text = '外观'
+    $lblLook.SetBounds(16, 324, 40, 24)
+    $lblLook.ForeColor = $clrFg
+    $dlg.Controls.Add($lblLook)
+
+    # 当前底色的小色块
+    $swatch = New-Object Windows.Forms.Panel
+    $script:SetSwatch = $swatch
+    $swatch.SetBounds(58, 326, 26, 20)
+    $swatch.BorderStyle = 'FixedSingle'
+    try { $swatch.BackColor = $script:clrBg } catch { }
+    $dlg.Controls.Add($swatch)
+
+    $btnColor = New-Object Windows.Forms.Button
+    $btnColor.Text = '背景颜色'
+    $btnColor.SetBounds(92, 322, 96, 26)
+    $btnColor.Add_Click({
+        $cd = New-Object Windows.Forms.ColorDialog
+        $cd.FullOpen = $true
+        $cd.AnyColor = $true
+        try { $cd.Color = $script:clrBg } catch { }
+        if ($cd.ShowDialog() -eq [Windows.Forms.DialogResult]::OK) {
+            $c = $cd.Color
+            $script:ThemeBg = ('#{0:X2}{1:X2}{2:X2}' -f [int]$c.R, [int]$c.G, [int]$c.B)
+            Apply-Appearance
+            if ($script:SetSwatch) { try { $script:SetSwatch.BackColor = $script:clrBg } catch { } }
+        }
+    })
+    $dlg.Controls.Add($btnColor)
+
+    $btnImg = New-Object Windows.Forms.Button
+    $btnImg.Text = '背景图…'
+    $btnImg.SetBounds(194, 322, 96, 26)
+    $btnImg.Add_Click({
+        $ofd = New-Object Windows.Forms.OpenFileDialog
+        $ofd.Title = '选一张背景图'
+        $ofd.Filter = '图片文件|*.jpg;*.jpeg;*.png;*.bmp;*.gif|所有文件|*.*'
+        if ($ofd.ShowDialog() -eq [Windows.Forms.DialogResult]::OK) {
+            $old = $script:ThemeImage
+            $script:ThemeImage = $ofd.FileName
+            Apply-Appearance
+            if (-not $script:ThemeImg) {
+                # 读不出来（不是图片 / 文件被占用）就退回去，别让框变成一片白
+                $script:ThemeImage = $old
+                Apply-Appearance
+                [Windows.Forms.MessageBox]::Show('这个文件读不成图片，换一张试试。', '桌面框', 'OK', 'Warning') | Out-Null
+            }
+            if ($script:SetSwatch) { try { $script:SetSwatch.BackColor = $script:clrBg } catch { } }
+        }
+    })
+    $dlg.Controls.Add($btnImg)
+
+    $btnClearImg = New-Object Windows.Forms.Button
+    $btnClearImg.Text = '清除背景图'
+    $btnClearImg.SetBounds(296, 322, 96, 26)
+    $btnClearImg.Add_Click({
+        $script:ThemeImage = ''
+        Apply-Appearance
+        if ($script:SetSwatch) { try { $script:SetSwatch.BackColor = $script:clrBg } catch { } }
+    })
+    $dlg.Controls.Add($btnClearImg)
+
+    $btnLookReset = New-Object Windows.Forms.Button
+    $btnLookReset.Text = '恢复默认'
+    $btnLookReset.SetBounds(398, 322, 96, 26)
+    $btnLookReset.Add_Click({
+        $script:ThemeBg = ''
+        $script:ThemeImage = ''
+        Apply-Appearance
+        if ($script:SetSwatch) { try { $script:SetSwatch.BackColor = $script:clrBg } catch { } }
+    })
+    $dlg.Controls.Add($btnLookReset)
+
     $btnAddDir = New-Object Windows.Forms.Button
     $btnAddDir.Text = '添加目录'
-    $btnAddDir.SetBounds(16, 344, 104, 32)
+    $btnAddDir.SetBounds(16, 364, 104, 32)
     $btnAddDir.Add_Click({
         $fb = New-Object Windows.Forms.FolderBrowserDialog
         $fb.Description = '选择要放进桌面框的文件夹'
@@ -1885,7 +2226,7 @@ function Show-Settings {
 
     $btnDel = New-Object Windows.Forms.Button
     $btnDel.Text = '移除选中'
-    $btnDel.SetBounds(128, 344, 104, 32)
+    $btnDel.SetBounds(128, 364, 104, 32)
     $btnDel.Add_Click({
         if (-not $script:SetList) { return }
         $idx = $script:SetList.SelectedIndex
@@ -1901,13 +2242,13 @@ function Show-Settings {
 
     $btnCfgFile = New-Object Windows.Forms.Button
     $btnCfgFile.Text = '打开配置文件'
-    $btnCfgFile.SetBounds(240, 344, 104, 32)
+    $btnCfgFile.SetBounds(240, 364, 104, 32)
     $btnCfgFile.Add_Click({ Start-Process -FilePath 'notepad.exe' -ArgumentList $script:ConfigPath })
     $dlg.Controls.Add($btnCfgFile)
 
     $btnOk = New-Object Windows.Forms.Button
     $btnOk.Text = '保存并关闭'
-    $btnOk.SetBounds(392, 344, 116, 32)
+    $btnOk.SetBounds(392, 364, 116, 32)
     $btnOk.Add_Click({
         $script:AppCfg.sources = @($script:Sources)
         if ($script:SetOpacity) {
@@ -1918,6 +2259,11 @@ function Show-Settings {
         if ($script:SetAutoStart) {
             try { Set-AutoStart -On ([bool]$script:SetAutoStart.Checked) | Out-Null } catch { }
         }
+        # 外观：背景色 / 背景图（''= 用默认）
+        try {
+            $script:AppCfg.window.bgColor = [string]$script:ThemeBg
+            $script:AppCfg.window.bgImage = [string]$script:ThemeImage
+        } catch { }
         Save-Config $script:AppCfg | Out-Null
         $script:SetSaved = $true
         if ($script:SetDlg) { $script:SetDlg.Close() }
@@ -1925,8 +2271,10 @@ function Show-Settings {
     $dlg.Controls.Add($btnOk)
 
     $hint = New-Object Windows.Forms.Label
-    $hint.Text = '不透明度越低越能透出后面的桌面，但文字也会跟着变淡。60%～85% 通常最舒服。'
-    $hint.SetBounds(16, 388, 492, 44)
+    $hint.Text = '不透明度越低越能透出后面的桌面，但文字也会跟着变淡。60%～85% 通常最舒服。' + "`r`n" +
+                 '背景图会显示在标题栏、状态栏和分区之间的缝隙里；分区列表用图片的平均色，' +
+                 '文字颜色会按背景深浅自动切成深色或浅色。'
+    $hint.SetBounds(16, 408, 492, 60)
     $hint.ForeColor = $clrMuted
     $dlg.Controls.Add($hint)
 
@@ -1936,6 +2284,17 @@ function Show-Settings {
     # 没点保存就关掉：把透明度退回原值，别留下半截效果
     if (-not $script:SetSaved) {
         try { $form.Opacity = [double]$script:AppCfg.window.opacity } catch { }
+        # 外观同理：试了颜色 / 换过图但没保存，退回配置里的样子
+        $bgBack = ''
+        try { $bgBack = [string]$script:AppCfg.window.bgColor } catch { }
+        if ($bgBack -notmatch '^#[0-9A-Fa-f]{6}$') { $bgBack = '' }
+        $imgBack = ''
+        try { $imgBack = [string]$script:AppCfg.window.bgImage } catch { }
+        if ($script:ThemeBg -ne $bgBack -or $script:ThemeImage -ne $imgBack) {
+            $script:ThemeBg = $bgBack
+            $script:ThemeImage = $imgBack
+            Apply-Appearance
+        }
     }
 
     $script:SetDlg = $null
@@ -1943,6 +2302,7 @@ function Show-Settings {
     $script:SetOpacity = $null
     $script:SetOpacityLabel = $null
     $script:SetAutoStart = $null
+    $script:SetSwatch = $null
 
     $script:AppCfg.sources = @($script:Sources)
     if ($script:Sources.Count -gt 0) {
@@ -1958,6 +2318,10 @@ function Show-Settings {
 }
 
 # ---------------------------------------------------------------- 窗口
+# 先把外观（背景色 / 背景图）算出来，下面所有控件创建时就能用对颜色
+$null = Reload-ThemeImage
+Update-Theme
+
 $form = New-Object Windows.Forms.Form
 $form.FormBorderStyle = 'None'
 $form.StartPosition = 'Manual'
@@ -2023,7 +2387,7 @@ $script:btnBack.Add_Click({
     }
 })
 $script:btnBack.Add_MouseEnter({ if ($script:History.Count -gt 0) { $this.BackColor = $clrHover } })
-$script:btnBack.Add_MouseLeave({ $this.BackColor = $clrBg })
+$script:btnBack.Add_MouseLeave({ $this.BackColor = (Get-BarBackColor) })
 $script:pnlTitle.Controls.Add($script:btnBack)
 
 $script:btnSettings = New-Object Windows.Forms.Label
@@ -2036,7 +2400,7 @@ $script:btnSettings.BackColor = $clrBg
 $script:btnSettings.ForeColor = $clrMuted
 $script:btnSettings.Add_Click({ Show-Settings })
 $script:btnSettings.Add_MouseEnter({ $this.BackColor = $clrHover })
-$script:btnSettings.Add_MouseLeave({ $this.BackColor = $clrBg })
+$script:btnSettings.Add_MouseLeave({ $this.BackColor = (Get-BarBackColor) })
 $script:pnlTitle.Controls.Add($script:btnSettings)
 
 # 固定：只锁住窗口的位置，防止手滑把框拖歪。
@@ -2051,7 +2415,7 @@ $script:btnLock.BackColor = $clrBg
 $script:btnLock.ForeColor = $clrMuted
 $script:btnLock.Add_Click({ Set-Locked (-not $script:Locked) })
 $script:btnLock.Add_MouseEnter({ if (-not $script:Locked) { $this.BackColor = $clrHover } })
-$script:btnLock.Add_MouseLeave({ if (-not $script:Locked) { $this.BackColor = $clrBg } })
+$script:btnLock.Add_MouseLeave({ if (-not $script:Locked) { $this.BackColor = (Get-BarBackColor) } })
 $script:pnlTitle.Controls.Add($script:btnLock)
 
 $script:btnRefresh = New-Object Windows.Forms.Label
@@ -2064,7 +2428,7 @@ $script:btnRefresh.BackColor = $clrBg
 $script:btnRefresh.ForeColor = $clrMuted
 $script:btnRefresh.Add_Click({ if ($script:CurrentPath) { Show-Folder -Path $script:CurrentPath -NoHistory } else { Show-AllSources } })
 $script:btnRefresh.Add_MouseEnter({ $this.BackColor = $clrHover })
-$script:btnRefresh.Add_MouseLeave({ $this.BackColor = $clrBg })
+$script:btnRefresh.Add_MouseLeave({ $this.BackColor = (Get-BarBackColor) })
 $script:pnlTitle.Controls.Add($script:btnRefresh)
 
 # 一键收放：⊟ 把所有分区的内容收起来，⊞ 再全部展开（图标画的是「按下去会做什么」）
@@ -2078,7 +2442,7 @@ $script:btnAllBlocks.BackColor = $clrBg
 $script:btnAllBlocks.ForeColor = $clrMuted
 $script:btnAllBlocks.Add_Click({ Toggle-AllBlocks })
 $script:btnAllBlocks.Add_MouseEnter({ $this.BackColor = $clrHover })
-$script:btnAllBlocks.Add_MouseLeave({ $this.BackColor = $clrBg })
+$script:btnAllBlocks.Add_MouseLeave({ $this.BackColor = (Get-BarBackColor) })
 $script:pnlTitle.Controls.Add($script:btnAllBlocks)
 
 $script:btnCollapse = New-Object Windows.Forms.Label
@@ -2091,7 +2455,7 @@ $script:btnCollapse.BackColor = $clrBg
 $script:btnCollapse.ForeColor = $clrMuted
 $script:btnCollapse.Add_Click({ Toggle-Collapse })
 $script:btnCollapse.Add_MouseEnter({ $this.BackColor = $clrHover })
-$script:btnCollapse.Add_MouseLeave({ $this.BackColor = $clrBg })
+$script:btnCollapse.Add_MouseLeave({ $this.BackColor = (Get-BarBackColor) })
 $script:pnlTitle.Controls.Add($script:btnCollapse)
 
 $script:btnClose = New-Object Windows.Forms.Label
@@ -2104,7 +2468,7 @@ $script:btnClose.BackColor = $clrBg
 $script:btnClose.ForeColor = $clrMuted
 $script:btnClose.Add_Click({ $form.Close() })
 $script:btnClose.Add_MouseEnter({ $this.BackColor = [Drawing.ColorTranslator]::FromHtml('#F2DCD8'); $this.ForeColor = [Drawing.ColorTranslator]::FromHtml('#B23B2E') })
-$script:btnClose.Add_MouseLeave({ $this.BackColor = $clrBg; $this.ForeColor = $clrMuted })
+$script:btnClose.Add_MouseLeave({ $this.BackColor = (Get-BarBackColor); $this.ForeColor = $clrMuted })
 $script:pnlTitle.Controls.Add($script:btnClose)
 
 $script:pnlTabs = New-Object Windows.Forms.Panel
@@ -2834,6 +3198,10 @@ foreach ($dc in @($script:lv, $script:pnlEmpty, $form)) {
 }
 
 $form.Add_Resize({ Update-Layout })
+
+# 控件都建好了，这时候才贴背景图（早于控件创建贴也行，但拿不到那些控件去改透明）
+Apply-BackgroundImage
+Update-ThemeControls
 $form.Add_Paint({
     param($paintSender, $paintArgs)
     try {
@@ -3120,6 +3488,69 @@ if ($SelfCheck) {
         $null = Set-AllBlocks $false
         $script:BlockCollapsed.Clear()
         Rebuild-Blocks
+    }
+
+    Step '外观：背景色 / 背景图' {
+        $bgKeep = $script:ThemeBg
+        $imgKeep = $script:ThemeImage
+        $tmpImg = Join-Path $env:TEMP 'dbx_theme_probe.png'
+        try {
+            # 1) 深色底：文字必须自动翻成浅色，否则黑底黑字等于看不见
+            $script:ThemeBg = '#1F2933'
+            $script:ThemeImage = ''
+            Apply-Appearance -NoRebuild
+            if ($script:clrBg.R -ne 0x1F -or $script:clrBg.G -ne 0x29 -or $script:clrBg.B -ne 0x33) {
+                throw ('背景色没生效：' + $script:clrBg.ToString())
+            }
+            if ((Get-ColorLum $script:clrFg) -lt 150) { throw '深色底上文字没变浅' }
+            if ($script:lblTitle.ForeColor -ne $script:clrFg) { throw '标题文字颜色没跟上' }
+            if ($script:lv.BackColor -ne $script:clrBg) { throw '列表底色没跟上' }
+
+            # 2) 浅色底：文字回到深色
+            $script:ThemeBg = '#EAF3FF'
+            Apply-Appearance -NoRebuild
+            if ((Get-ColorLum $script:clrFg) -gt 120) { throw '浅色底上文字还是浅的' }
+
+            # 3) 存盘 / 读回
+            $script:AppCfg.window.bgColor = $script:ThemeBg
+            if (-not (Save-Config $script:AppCfg)) { throw 'save failed' }
+            $back2 = Read-Config
+            if ([string]$back2.window.bgColor -ne '#EAF3FF') { throw ('bgColor 没存住：' + [string]$back2.window.bgColor) }
+
+            # 4) 背景图：贴上去、标题栏透明、分区之间开缝
+            $bmp = New-Object Drawing.Bitmap 16, 16
+            $g = [Drawing.Graphics]::FromImage($bmp)
+            $g.Clear([Drawing.Color]::FromArgb(255, 40, 90, 160))
+            $g.Dispose()
+            $bmp.Save($tmpImg, [Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            $script:ThemeBg = ''
+            $script:ThemeImage = $tmpImg
+            Apply-Appearance -NoRebuild
+            if (-not $script:ThemeImg) { throw '图片没读进来' }
+            if (-not $form.BackgroundImage) { throw '窗体没贴上背景图' }
+            if ($script:BlockGap -ne 8) { throw ('分区缝隙没开：' + $script:BlockGap) }
+            if ($script:pnlTitle.BackColor -ne [Drawing.Color]::Transparent) { throw '标题栏没透明，图透不出来' }
+            # 蓝色底 → 文字该是浅色
+            if ((Get-ColorLum $script:clrFg) -lt 150) { throw '图片底色偏深，文字却没变浅' }
+
+            # 5) 清掉图片，必须干干净净回到默认米白
+            $script:ThemeImage = ''
+            Apply-Appearance -NoRebuild
+            if ($form.BackgroundImage) { throw '背景图没清掉' }
+            if ($script:BlockGap -ne 0) { throw '分区缝隙没收回' }
+            if ($script:clrBg.R -ne 0xFB -or $script:clrBg.G -ne 0xFA -or $script:clrBg.B -ne 0xF7) {
+                throw ('没回到默认底色：' + $script:clrBg.ToString())
+            }
+            if ($script:pnlTitle.BackColor -ne $script:clrBg) { throw '标题栏没回到实色' }
+        } finally {
+            $script:ThemeBg = $bgKeep
+            $script:ThemeImage = $imgKeep
+            try { $script:AppCfg.window.bgColor = $bgKeep } catch { }
+            try { $script:AppCfg.window.bgImage = $imgKeep } catch { }
+            Apply-Appearance -NoRebuild
+            if (Test-Path -LiteralPath $tmpImg) { try { Remove-Item -LiteralPath $tmpImg -Force } catch { } }
+        }
     }
 
     Step '拖动改分区高度' {
